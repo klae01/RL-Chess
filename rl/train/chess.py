@@ -36,8 +36,7 @@ class RLConfig(PretrainedConfig):
     model_type: str = "fixed-width-attention"
     state_tokens: str = "\0 -/0123456789BKNPQRabcdefghknpqrw"
     max_state_length: int = 100
-    max_mask_count: int = 256
-    num_actions: Union[int, Tuple[int]] = (64, 64, 8)
+    num_actions: int = 1969
 
     hidden_size: int = 256
     num_hidden_layers: int = 4
@@ -110,13 +109,15 @@ class RLPretrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         @torch.no_grad()
-        def normalize_dim(tensor: torch.Tensor, scale: float = 1.0, dim: int = -1):
-            return tensor.normal_(0, scale).div_(tensor.size(dim) ** 0.5)
+        def normalize_dim(
+            tensor: torch.Tensor, scale: float = 1.0, dim: int = -1, pow=0.5
+        ):
+            return tensor.normal_(0, scale).div_(tensor.size(dim) ** pow)
 
         if isinstance(module, PolicyNetwork):
-            normalize_dim(module.positional_embedding)
-            normalize_dim(module.projection, 0.1)
-            # module.logit_scale.data.fill_(0.0)
+            normalize_dim(module.positional_embedding, scale=0.2, pow=0.5)
+            normalize_dim(module.action_head.weight, scale=0.1, pow=1)
+            nn.init.constant_(module.action_head.bias, 0.0)
         if isinstance(module, ValueNetwork):
             nn.init.constant_(module.fc.weight, 0.0)
             nn.init.constant_(module.fc.bias, 0.0)
@@ -155,19 +156,16 @@ class PolicyNetwork(RLPretrainedModel):
         super().__init__(config)
 
         self.actions = config.num_actions
-        query_size = np.prod(self.actions[:1])
-        proj_size = np.prod(self.actions[1:])
-
-        self.ff_length = 1 << int(query_size + config.max_state_length - 1).bit_length()
+        self.ff_length = 1 << int(config.max_state_length - 1).bit_length()
         self.embedding = nn.Embedding(len(config.state_tokens), config.hidden_size)
         self.positional_embedding = nn.Parameter(
             torch.empty([self.ff_length, config.hidden_size])
         )
-        self.projection = nn.Parameter(torch.empty([proj_size, config.hidden_size]))
         self.layers = nn.ModuleList(
             [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.post_layernorm = nn.RMSNorm(config.hidden_size)
+        self.action_head = nn.Linear(config.hidden_size, self.actions)
 
         self.post_init()
 
@@ -176,25 +174,17 @@ class PolicyNetwork(RLPretrainedModel):
         x: shape [B, T, D]
         hidden: optional shape [B, D]
         """
-        B, T, _ = x.shape
+        B, T, D = x.shape
         x = x.flatten(0, 1)  # [BT, D]
         x = self.embedding(x)
-
-        pad_shape = list(x.shape)
-        pad_shape[1] = self.ff_length - self.config.max_state_length
-
-        x = torch.cat([x.new_zeros(pad_shape), x], 1)
-        x = x + self.positional_embedding[None]
+        x = F.pad(x, pad=(0, 0, 0, self.ff_length - D), mode="constant", value=0)
+        x = x + self.positional_embedding.unsqueeze(0)
         for encoder_layer in self.layers:
             x = encoder_layer(x, attention_mask=None)[0]
-        x = x[..., : self.actions[0], :]
-        query = self.post_layernorm(x)  # [B x T, A1, d]
-        key = self.projection  # [A2 x A3, d]
-
-        logits = torch.einsum("bid,jd->bij", query, key)
-        logits = F.log_softmax(logits.flatten(1), -1, dtype=torch.float32).reshape(
-            B, T, *self.actions
-        )
+        x = x[:, -1, :]
+        x = self.post_layernorm(x)  # [B x T, d]
+        x = self.action_head(x)
+        logits = F.log_softmax(x, -1, dtype=torch.float32).reshape(B, T, self.actions)
         return logits, self.dummy_hidden(B)
 
     def forward_single(
@@ -202,7 +192,6 @@ class PolicyNetwork(RLPretrainedModel):
         x: torch.Tensor,
         hidden: Optional[torch.Tensor] = None,
     ):
-        """ """
         x = x.unsqueeze(1)
         logits, hidden = self.forward(x, hidden)
         return logits.squeeze(1), hidden
@@ -461,16 +450,7 @@ class TrajectoryManager:
                         padding="max_length",
                     )
                     state = torch.tensor(self._state)
-                    self._mask = torch.sparse_coo_tensor(
-                        indices=torch.tensor(
-                            obs["allowed_actions"], dtype=torch.long
-                        ).t(),
-                        values=torch.ones(
-                            len(obs["allowed_actions"]), dtype=torch.bool
-                        ),
-                        size=self.config.num_actions,
-                        dtype=torch.bool,
-                    )
+                    self._mask = obs["action_mask"]
                 return state, (terminated or truncated)
             case _:
                 raise RuntimeError(
@@ -484,19 +464,20 @@ class TrajectoryManager:
                 self.step_trigger = True
                 self._prev_creward = self._creward
 
-                allowed_indices = self._mask._indices()  # shape: [ndim, n_allowed]
-                allowed_logits = logits[tuple(allowed_indices)]  # shape: [n_allowed]
-
+                action_mask = torch.from_numpy(self._mask)
+                allowed_indices = action_mask.nonzero()[:, 0]
+                allowed_logits = logits[self._mask]
                 log_probs = torch.log_softmax(allowed_logits, dim=0)
                 probs = torch.softmax(allowed_logits, dim=0)
                 chosen_idx = torch.multinomial(probs, num_samples=1).item()
-                action = allowed_indices[:, chosen_idx].tolist()
+                action = allowed_indices[chosen_idx].item()
+                action_logit = log_probs[chosen_idx].item()
                 self.env.step(action)
 
                 self.t_state.append(self._state)
-                self.t_action_mask.append(self._mask)
+                self.t_action_mask.append(action_mask)
                 self.t_action.append(action)
-                self.t_action_logit.append(log_probs[chosen_idx].item())
+                self.t_action_logit.append(action_logit)
 
                 self.state = TrajectoryState.WAITING_FOR_LAST
             case _:
@@ -646,29 +627,17 @@ class RLTrainer(Trainer):
         intrinsic_reward = inputs["intrinsic_reward"]
         mask = inputs["mask"]
 
-        B, C, _ = action.shape
-        i_idx = torch.arange(B).view(B, 1).expand(B, C)
-        j_idx = torch.arange(C).view(1, C).expand(B, C)
         outputs = model(state, mode="trajectory")
-
-        masked_logits = F.log_softmax(
-            outputs["logits"].masked_fill(~action_mask, float("-inf")).flatten(2), -1
-        ).reshape_as(action_mask)
-        policy_logit = masked_logits[i_idx, j_idx, *action.unbind(-1)]
+        masked_logits = outputs["logits"].masked_fill(~action_mask, float("-inf"))
+        reweight_logits = F.log_softmax(masked_logits, -1)
+        policy_logit = reweight_logits.gather(-1, action.unsqueeze(-1)).squeeze(-1)
         log_rho = (policy_logit - action_logit.detach()).masked_fill(~mask, 0).cumsum(1)
         log_rho_offset = log_rho.detach()[mask].logsumexp(0)
         scaled_rho = (log_rho - log_rho_offset).exp()
         policy_loss = (scaled_rho * reward)[mask].sum().mul(-1)
 
         if self.config.policy_valid_loss_weight:
-            policy_valid_loss = (
-                outputs["logits"]
-                .masked_fill(~action_mask, float("-inf"))
-                .flatten(-len(self.config.num_actions))
-                .logsumexp(-1)[mask]
-                .mean()
-                .mul(-1)
-            )
+            policy_valid_loss = masked_logits.logsumexp(-1)[mask].mean().mul(-1)
         else:
             policy_valid_loss = 0
 
@@ -731,6 +700,11 @@ def run_experiment(
     # single agent self play
     env_name = ENV.__name__
     env = ENV()
+
+    config.max_state_length = int(
+        next(iter(env.observation_spaces.values()))["fen"].max_length
+    )
+    config.num_actions = int(next(iter(env.action_spaces.values())).n)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = RLModel(config).to(device).bfloat16()

@@ -1,5 +1,5 @@
 import collections
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import chess
 import chess.pgn
@@ -8,15 +8,37 @@ import numpy as np
 from pettingzoo.utils.agent_selector import agent_selector as AgentSelector
 from pettingzoo.utils.env import AECEnv
 
-# --- Special action indices ---
-SPECIAL_NONE = 0
-SPECIAL_PROMOTE_QUEEN = 1
-SPECIAL_PROMOTE_ROOK = 2
-SPECIAL_PROMOTE_BISHOP = 3
-SPECIAL_PROMOTE_KNIGHT = 4
-SPECIAL_CASTLE_KINGSIDE = 5
-SPECIAL_CASTLE_QUEENSIDE = 6
-SPECIAL_DRAW_CLAIM = 7
+
+def build_legal_moves() -> List[chess.Move]:
+    piece_types = [
+        chess.PAWN,
+        chess.KNIGHT,
+        chess.BISHOP,
+        chess.ROOK,
+        chess.QUEEN,
+        chess.KING,
+    ]
+    colors = [chess.WHITE, chess.BLACK]
+    legal_moves_set = set()
+    for square in chess.SQUARES:
+        for piece_type in piece_types:
+            for color in colors:
+                for fill in range(2):
+                    board = chess.Board()
+                    board.clear()
+                    if fill:
+                        for s in chess.SQUARES:
+                            board.set_piece_at(s, chess.Piece(chess.PAWN, not color))
+                    board.set_piece_at(square, chess.Piece(piece_type, color))
+                    board.turn = color
+                    legal_moves_set.update(board.legal_moves)
+    return sorted(legal_moves_set, key=lambda move: move.uci())
+
+
+SPECIAL_DRAW_CLAIM = chess.Move.from_uci("0000")
+LEGAL_MOVES = [SPECIAL_DRAW_CLAIM] + build_legal_moves()
+MAX_ACTIONS = len(LEGAL_MOVES)
+MOVE_TO_INDEX = {move.uci(): idx for idx, move in enumerate(LEGAL_MOVES)}
 
 
 class ChessEnv(AECEnv):
@@ -38,8 +60,8 @@ class ChessEnv(AECEnv):
             color: gym.spaces.Dict(
                 {
                     "fen": gym.spaces.Text(max_length=100, charset="utf-8"),
-                    "allowed_actions": gym.spaces.Sequence(
-                        gym.spaces.Box(low=0, high=7, shape=(3,), dtype=np.int8)
+                    "action_mask": gym.spaces.Box(
+                        low=0, high=1, shape=(MAX_ACTIONS,), dtype=np.bool_
                     ),
                 }
             )
@@ -47,8 +69,7 @@ class ChessEnv(AECEnv):
         }
 
         self.action_spaces = {
-            color: gym.spaces.MultiDiscrete([64, 64, 8])
-            for color in self.possible_agents
+            color: gym.spaces.Discrete(MAX_ACTIONS) for color in self.possible_agents
         }
 
         # Initialize state variables
@@ -80,18 +101,32 @@ class ChessEnv(AECEnv):
             self._was_dead_step(action)
             return
 
-        claim_draw = action[2] == SPECIAL_DRAW_CLAIM
+        claim_draw = False
         move = self.interpret_action(action)
 
-        if move != chess.Move.null():
+        if move == SPECIAL_DRAW_CLAIM:
+            claim_draw = True
+            possible, draw_move = self.check_draw_claim_possibility()
+            if not possible:
+                raise ValueError("Draw claim is not possible in the current position.")
+            if draw_move is not None:
+                if self.board.is_legal(draw_move):
+                    move = draw_move
+                    self.board.push(move)
+                else:
+                    raise ValueError(f"Draw claim move {draw_move.uci()} is not legal.")
+        else:
             if not self.board.is_legal(move):
-                raise ValueError(f"Invalid move attempted by {turn}: {move.uci()}")
+                raise ValueError(
+                    f"Invalid move attempted by agent {turn}: {move.uci()}"
+                )
             self.board.push(move)
 
         self.outcome = self.board.outcome(claim_draw=claim_draw)
-
         if claim_draw and self.outcome is None:
-            raise ValueError("Invalid claim draw: Draw conditions not met")
+            raise ValueError(
+                "Invalid draw claim: draw conditions are not met after the move."
+            )
 
         # Determine game outcome
         if self.outcome is not None:
@@ -120,11 +155,7 @@ class ChessEnv(AECEnv):
         """Returns the board state."""
         if agent not in self.agents:
             return None
-
-        return {
-            "fen": self.board.fen(),
-            "allowed_actions": self.get_allowed_actions(agent),
-        }
+        return {"fen": self.board.fen(), "action_mask": self.get_action_mask()}
 
     def render(self):
         """Displays the chessboard in Unicode format."""
@@ -140,20 +171,7 @@ class ChessEnv(AECEnv):
 
     def interpret_action(self, action):
         """Converts an action into a chess.Move object."""
-        from_sq, to_sq, special = action
-        promotion = {
-            SPECIAL_PROMOTE_QUEEN: chess.QUEEN,
-            SPECIAL_PROMOTE_ROOK: chess.ROOK,
-            SPECIAL_PROMOTE_BISHOP: chess.BISHOP,
-            SPECIAL_PROMOTE_KNIGHT: chess.KNIGHT,
-        }.get(special, None)
-
-        if special == SPECIAL_DRAW_CLAIM:
-            if from_sq == to_sq:
-                return chess.Move.null()
-            return chess.Move(from_sq, to_sq, promotion=promotion)
-
-        return chess.Move(from_sq, to_sq, promotion=promotion)
+        return LEGAL_MOVES[action]
 
     def can_claim_draw(self):
         """
@@ -162,40 +180,39 @@ class ChessEnv(AECEnv):
         """
         return self.board.can_claim_fifty_moves() or self.board.is_repetition(3)
 
-    def can_claim_draw_after_move(self, move):
-        """Checks whether a draw can be claimed after executing the given move."""
-        self.board.push(move)
-        claim_possible = self.can_claim_draw()
-        self.board.pop()
-        return claim_possible
+    def check_draw_claim_possibility(self) -> Tuple[bool, Optional[chess.Move]]:
+        """
+        Checks if a draw claim is possible immediately or after a legal move.
 
-    def get_allowed_actions(self, color):
-        """Returns all currently legal actions."""
-        allowed = []
-        for move in self.board.legal_moves:
-            special = SPECIAL_NONE
-            if self.board.is_castling(move):
-                if self.board.is_kingside_castling(move):
-                    special = SPECIAL_CASTLE_KINGSIDE
-                elif self.board.is_queenside_castling(move):
-                    special = SPECIAL_CASTLE_QUEENSIDE
-            elif move.promotion is not None:
-                special = {
-                    chess.QUEEN: SPECIAL_PROMOTE_QUEEN,
-                    chess.ROOK: SPECIAL_PROMOTE_ROOK,
-                    chess.BISHOP: SPECIAL_PROMOTE_BISHOP,
-                    chess.KNIGHT: SPECIAL_PROMOTE_KNIGHT,
-                }.get(move.promotion, SPECIAL_NONE)
-            allowed.append((move.from_square, move.to_square, special))
-
-            if self.can_claim_draw_after_move(move):
-                allowed.append((move.from_square, move.to_square, SPECIAL_DRAW_CLAIM))
-
+        Returns:
+            (True, None) if a draw claim is possible immediately.
+            (True, move) if playing a legal move enables a draw claim.
+            (False, None) if no move can lead to a draw claim.
+        """
         if self.can_claim_draw():
-            king_sq = self.board.king(color)
-            if king_sq is not None:
-                allowed.append((king_sq, king_sq, SPECIAL_DRAW_CLAIM))
-        return allowed
+            return True, None
+
+        for move in self.board.legal_moves:
+            self.board.push(move)
+            if self.can_claim_draw():
+                self.board.pop()
+                return True, move
+            self.board.pop()
+
+        return False, None
+
+    def get_action_mask(self) -> np.ndarray:
+        mask = np.zeros(MAX_ACTIONS, dtype=np.bool_)
+        claim_index = MOVE_TO_INDEX[SPECIAL_DRAW_CLAIM.uci()]
+        mask[claim_index] = self.check_draw_claim_possibility()[0]
+        for move in self.board.legal_moves:
+            code = move.uci()
+            if code not in MOVE_TO_INDEX:
+                raise ValueError(
+                    f"Unexpected move {code} not found in MOVE_TO_INDEX mapping. Please update the global legal moves set."
+                )
+            mask[MOVE_TO_INDEX[code]] = True
+        return mask
 
     def save(self, fp=None):
         """Saves the current game in PGN format."""
